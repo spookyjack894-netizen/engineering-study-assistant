@@ -1,9 +1,15 @@
+from __future__ import annotations
+
+import base64
+import io
 from datetime import date, datetime
-from typing import Optional
+from typing import Any
 
 import pymupdf
 import streamlit as st
 from groq import Groq
+from openai import OpenAI
+from PIL import Image
 
 
 # =========================================================
@@ -22,8 +28,15 @@ st.set_page_config(
 # CONSTANTS
 # =========================================================
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-MAX_NOTE_CHARACTERS = 45_000
+TEXT_MODEL = "llama-3.3-70b-versatile"
+
+# This model name can be changed in the sidebar if Groq updates
+# its available vision models.
+VISION_MODEL = "qwen/qwen3.6-27b"
+
+MAX_TEXT_CHARACTERS = 45_000
+MAX_VISION_PAGES = 5
+PDF_RENDER_DPI = 150
 
 STUDY_ACTIONS = [
     "Expand my notes",
@@ -40,10 +53,11 @@ STUDY_ACTIONS = [
 # =========================================================
 
 def initialize_session_state() -> None:
-    """Create temporary storage used while the app is open."""
+    """Create temporary app storage for the current browser session."""
 
-    defaults = {
+    defaults: dict[str, Any] = {
         "notes_result": "",
+        "vision_transcription": "",
         "tutor_result": "",
         "planner_result": "",
         "reflection_result": "",
@@ -66,12 +80,7 @@ initialize_session_state()
 # =========================================================
 
 def get_groq_api_key() -> str:
-    """
-    Read the Groq API key from Streamlit Secrets.
-
-    The key must be entered in Streamlit as:
-    GROQ_API_KEY = "your-key"
-    """
+    """Read the Groq key from Streamlit Secrets."""
 
     try:
         return str(st.secrets["GROQ_API_KEY"]).strip()
@@ -83,63 +92,48 @@ GROQ_API_KEY = get_groq_api_key()
 
 
 # =========================================================
-# PDF FUNCTIONS
+# GENERAL AI FUNCTIONS
 # =========================================================
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
+def get_groq_client() -> Groq:
+    """Create the normal Groq SDK client."""
+
+    if not GROQ_API_KEY:
+        raise ValueError(
+            "Your Groq API key has not been added to Streamlit Secrets."
+        )
+
+    return Groq(api_key=GROQ_API_KEY)
+
+
+def get_groq_responses_client() -> OpenAI:
     """
-    Extract machine-readable text from a PDF.
+    Create an OpenAI-compatible client pointed toward Groq.
 
-    This works best for typed notes and digital lecture slides.
-    Scanned handwriting may not contain extractable text.
-    """
-
-    document = pymupdf.open(
-        stream=pdf_bytes,
-        filetype="pdf",
-    )
-
-    extracted_pages = []
-
-    try:
-        for page_number, page in enumerate(document, start=1):
-            page_text = page.get_text(
-                "text",
-                sort=True,
-            ).strip()
-
-            if page_text:
-                extracted_pages.append(
-                    f"\n\n--- PAGE {page_number} ---\n\n{page_text}"
-                )
-    finally:
-        document.close()
-
-    return "".join(extracted_pages).strip()
-
-
-# =========================================================
-# AI FUNCTIONS
-# =========================================================
-
-def call_ai(
-    system_message: str,
-    user_message: str,
-    model_name: str = DEFAULT_MODEL,
-    temperature: float = 0.3,
-    max_tokens: int = 4_000,
-) -> str:
-    """
-    Send a request to Groq and return the model's text response.
+    We use this client for the Responses API and image inputs.
     """
 
     if not GROQ_API_KEY:
         raise ValueError(
-            "Your Groq API key has not been added to "
-            "Streamlit Secrets."
+            "Your Groq API key has not been added to Streamlit Secrets."
         )
 
-    client = Groq(api_key=GROQ_API_KEY)
+    return OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+
+
+def call_text_ai(
+    system_message: str,
+    user_message: str,
+    model_name: str,
+    temperature: float = 0.3,
+    max_tokens: int = 4_000,
+) -> str:
+    """Send a normal text request to Groq."""
+
+    client = get_groq_client()
 
     response = client.chat.completions.create(
         model=model_name,
@@ -168,31 +162,288 @@ def call_ai(
     return result.strip()
 
 
+# =========================================================
+# FILE AND IMAGE FUNCTIONS
+# =========================================================
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    """
+    Extract embedded machine-readable text from a PDF.
+
+    This works for typed PDFs and digital lecture slides.
+    Image-based and handwritten pages may return no text.
+    """
+
+    document = pymupdf.open(
+        stream=pdf_bytes,
+        filetype="pdf",
+    )
+
+    extracted_pages: list[str] = []
+
+    try:
+        for page_number, page in enumerate(document, start=1):
+            page_text = page.get_text(
+                "text",
+                sort=True,
+            ).strip()
+
+            if page_text:
+                extracted_pages.append(
+                    f"\n\n--- PAGE {page_number} ---\n\n{page_text}"
+                )
+
+    finally:
+        document.close()
+
+    return "".join(extracted_pages).strip()
+
+
+def get_pdf_page_count(pdf_bytes: bytes) -> int:
+    """Return the number of pages in a PDF."""
+
+    document = pymupdf.open(
+        stream=pdf_bytes,
+        filetype="pdf",
+    )
+
+    try:
+        return len(document)
+    finally:
+        document.close()
+
+
+def render_pdf_pages(
+    pdf_bytes: bytes,
+    start_page: int,
+    end_page: int,
+    dpi: int = PDF_RENDER_DPI,
+) -> list[tuple[int, bytes]]:
+    """
+    Render selected PDF pages as PNG images.
+
+    Page numbers supplied by the user are 1-based.
+    """
+
+    document = pymupdf.open(
+        stream=pdf_bytes,
+        filetype="pdf",
+    )
+
+    rendered_pages: list[tuple[int, bytes]] = []
+
+    try:
+        for page_index in range(start_page - 1, end_page):
+            page = document[page_index]
+
+            pixmap = page.get_pixmap(
+                dpi=dpi,
+                alpha=False,
+            )
+
+            png_bytes = pixmap.tobytes("png")
+
+            rendered_pages.append(
+                (
+                    page_index + 1,
+                    png_bytes,
+                )
+            )
+
+    finally:
+        document.close()
+
+    return rendered_pages
+
+
+def normalize_image_bytes(
+    image_bytes: bytes,
+    max_width: int = 1800,
+) -> bytes:
+    """
+    Convert an uploaded image into a reasonably sized RGB JPEG.
+
+    Reducing very large images helps avoid oversized API requests.
+    """
+
+    image = Image.open(io.BytesIO(image_bytes))
+    image = image.convert("RGB")
+
+    if image.width > max_width:
+        scale = max_width / image.width
+
+        new_height = int(image.height * scale)
+
+        image = image.resize(
+            (max_width, new_height)
+        )
+
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=90,
+        optimize=True,
+    )
+
+    return output.getvalue()
+
+
+def image_bytes_to_data_url(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> str:
+    """Convert image bytes into a Base64 data URL."""
+
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def analyze_page_images(
+    page_images: list[tuple[str, bytes]],
+    vision_model: str,
+    extra_context: str,
+) -> str:
+    """
+    Ask a vision model to read handwritten or image-based notes.
+
+    Each tuple contains:
+        (page label, image bytes)
+    """
+
+    if not page_images:
+        raise ValueError("No page images were supplied.")
+
+    if len(page_images) > MAX_VISION_PAGES:
+        raise ValueError(
+            f"Only {MAX_VISION_PAGES} pages can be analyzed at once."
+        )
+
+    client = get_groq_responses_client()
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": f"""
+You are examining engineering study notes.
+
+Read the attached pages carefully.
+
+The pages may contain:
+
+- handwriting,
+- equations,
+- subscripts and superscripts,
+- diagrams,
+- arrows,
+- graphs,
+- annotations,
+- chemistry notation,
+- physics notation,
+- partially completed problems.
+
+Student context:
+
+{extra_context or "No additional context was supplied."}
+
+Create a careful page-by-page transcription and interpretation.
+
+For each page:
+
+1. Label the page clearly.
+2. Transcribe readable writing.
+3. Preserve equations using clear mathematical notation.
+4. Describe diagrams, graphs, arrows, and layouts.
+5. Mark uncertain readings with [uncertain].
+6. Do not silently guess illegible words.
+7. Identify likely subject areas and main concepts.
+8. Point out anything that may have been copied incorrectly.
+9. Do not solve the entire assignment unless needed to explain the page.
+
+Finish with:
+
+- Main concepts found
+- Equations detected
+- Areas needing manual verification
+- Important missing explanations
+
+Use clear Markdown.
+""",
+        }
+    ]
+
+    for page_label, raw_image_bytes in page_images:
+        normalized_image = normalize_image_bytes(raw_image_bytes)
+
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"Image label: {page_label}",
+            }
+        )
+
+        content.append(
+            {
+                "type": "input_image",
+                "detail": "high",
+                "image_url": image_bytes_to_data_url(
+                    normalized_image,
+                    mime_type="image/jpeg",
+                ),
+            }
+        )
+
+    response = client.responses.create(
+        model=vision_model,
+        input=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+    )
+
+    result = response.output_text
+
+    if not result:
+        raise ValueError(
+            "The vision model returned an empty response."
+        )
+
+    return result.strip()
+
+
+# =========================================================
+# NOTES LAB PROMPTS
+# =========================================================
+
 def build_notes_instruction(selected_action: str) -> str:
-    """Return instructions for the selected Notes Lab action."""
+    """Return instructions for the selected Notes Lab operation."""
 
     instructions = {
         "Expand my notes": """
 Expand incomplete explanations while preserving the student's
-original structure.
+original organization.
 
 Include:
 
 1. What the notes already explain
 2. Expanded explanations
-3. Definitions that are missing
+3. Missing definitions
 4. Equations and meanings of variables
-5. Assumptions
-6. Physical or molecular intuition
-7. Engineering applications
-8. Common mistakes
-9. Questions the student should investigate
+5. Units when relevant
+6. Assumptions
+7. Physical or molecular intuition
+8. Engineering applications
+9. Common mistakes
+10. Questions the student should investigate
 
-Clearly distinguish content found in the notes from information
-you are adding.
+Clearly distinguish original note content from added explanations.
 """,
         "Build a study guide": """
-Convert the notes into a structured study guide.
+Convert the notes into a structured engineering study guide.
 
 Include:
 
@@ -200,26 +451,26 @@ Include:
 2. Main concepts
 3. Essential definitions
 4. Important equations
-5. Meaning and units of variables
+5. Variable meanings and units
 6. Assumptions and limitations
 7. Physical or molecular intuition
 8. Conceptual examples
 9. Common misconceptions
-10. Final review checklist
+10. A final review checklist
 """,
         "Find missing concepts": """
-Identify ideas that are incomplete, unexplained, disconnected,
-or likely to cause confusion.
+Identify ideas that appear incomplete, unexplained, disconnected,
+or likely to create confusion.
 
 For every missing area:
 
-1. Identify the relevant topic
+1. Identify the topic
 2. Explain what is missing
 3. Supply a careful explanation
 4. Explain why it matters
 5. Give one active-recall question
 
-Do not claim that added information appeared in the PDF.
+Do not claim that added information originally appeared in the notes.
 """,
         "Create practice questions": """
 Create an engineering practice set based on the notes.
@@ -232,11 +483,10 @@ Include:
 4. Two misconception-detection questions
 5. One challenging transfer problem
 
-Place all solutions in a separate answer-key section at the end.
-Do not make every question a simple definition question.
+Place solutions in a separate answer-key section at the end.
 """,
         "Explain with intuition": """
-Identify the most difficult concepts and explain each through:
+Explain the hardest concepts through:
 
 1. Everyday intuition
 2. Physical or molecular interpretation
@@ -244,12 +494,12 @@ Identify the most difficult concepts and explain each through:
 4. Engineering application
 5. Limiting cases
 6. Important assumptions
-7. Conditions under which the equation or model fails
+7. Failure conditions
 
-Explain what happens when major variables increase or decrease.
+Explain what happens when important variables increase or decrease.
 """,
         "Create flashcards": """
-Create useful active-recall flashcards.
+Create 15 to 25 active-recall flashcards.
 
 Use this format:
 
@@ -258,47 +508,44 @@ Answer:
 
 Include:
 
-1. Definitions
-2. Equation meanings
-3. Assumptions
-4. Conceptual relationships
-5. Common mistakes
-6. Physical intuition
-7. Engineering applications
+- definitions,
+- equation meanings,
+- assumptions,
+- conceptual relationships,
+- common mistakes,
+- physical intuition,
+- engineering applications.
 
-Create between 15 and 25 cards.
-Avoid cards that are too long.
+Avoid answers that are excessively long.
 """,
     }
 
     return instructions[selected_action]
 
 
-def analyze_notes(
+def create_study_resource(
     notes_text: str,
     selected_action: str,
     student_context: str,
-    model_name: str,
+    text_model: str,
 ) -> str:
-    """Analyze extracted notes using the selected learning mode."""
+    """Generate a study resource from extracted or vision-read notes."""
 
     system_message = """
 You are an engineering learning coach specializing in physics,
 chemistry, mathematics, and chemical engineering.
 
-Your purpose is to improve the student's reasoning, intuition,
-retention, and technical communication.
+Improve the student's reasoning, intuition, retention, and technical
+communication.
 
-Do not pretend that AI-generated material originally appeared in
-the student's notes.
+Do not fabricate sources, course requirements, experiments, or equations.
 
-Do not fabricate sources, course requirements, experimental results,
-or equations.
+Do not pretend AI-generated material originally appeared in the notes.
 
 Use clear Markdown headings.
 
-Technical equations and calculations should be presented carefully,
-and the student should be reminded to verify high-stakes technical work.
+Flag uncertain technical information and remind the student to verify
+important equations and calculations.
 """
 
     action_instruction = build_notes_instruction(selected_action)
@@ -319,69 +566,69 @@ TASK INSTRUCTIONS
 {action_instruction}
 
 
-STUDENT NOTES
+NOTES OR VISION TRANSCRIPTION
 
 {notes_text}
 """
 
-    return call_ai(
+    return call_text_ai(
         system_message=system_message,
         user_message=user_message,
-        model_name=model_name,
+        model_name=text_model,
         temperature=0.25,
         max_tokens=5_000,
     )
 
+
+# =========================================================
+# INTUITION TUTOR
+# =========================================================
 
 def generate_tutor_response(
     subject: str,
     topic: str,
     student_attempt: str,
     tutor_mode: str,
-    model_name: str,
+    text_model: str,
 ) -> str:
-    """Create a tutoring response for physics, chemistry, or engineering."""
+    """Generate a Socratic or explanatory tutor response."""
 
     system_message = """
 You are a Socratic engineering tutor.
 
-Your purpose is to help students develop intuition and independent
-reasoning rather than merely giving answers.
+Help the student develop independent reasoning instead of immediately
+giving an answer.
 
-When a student provides an attempted solution:
+When an attempt is provided:
 
 1. Identify what is correct
-2. Identify the first important reasoning error
+2. Identify the first important error
 3. Explain why it is an error
 4. Give the smallest useful hint
 5. Ask one question that moves the student forward
 
-Do not provide a complete numerical solution unless the student
-explicitly asks for a full solution or has already attempted the work.
-
-Use equations when helpful, but explain their physical meaning.
+Explain the physical meaning of equations.
 """
 
     mode_instructions = {
         "Socratic hints": """
-Do not immediately solve the problem.
-Give one useful hint and one question at a time.
+Do not solve the entire problem immediately.
+Give one hint and one forward-moving question.
 """,
         "Intuition builder": """
-Explain the concept through physical, molecular, mathematical,
+Explain the topic through physical, molecular, mathematical,
 and engineering perspectives.
 """,
         "Equation explorer": """
-Explain where the main equation comes from, what every variable
-means, its assumptions, units, limiting cases, and failure conditions.
+Explain where the equation comes from, every variable, units,
+assumptions, limiting cases, and failure conditions.
 """,
         "Misconception check": """
-Look for hidden misconceptions in the student's explanation.
-Explain the misconception and provide a contrasting example.
+Identify hidden misconceptions and give a contrasting example.
 """,
         "Full explanation": """
-Give a complete teaching explanation, including reasoning,
-equations, assumptions, and a final self-check question.
+Give a complete teaching explanation with reasoning, equations,
+assumptions, and a self-check question.
 """,
     }
 
@@ -396,43 +643,47 @@ TOPIC OR PROBLEM
 {topic}
 
 
-STUDENT'S CURRENT ATTEMPT OR UNDERSTANDING
+STUDENT ATTEMPT
 
-{student_attempt or "The student has not provided an attempt yet."}
+{student_attempt or "No attempt has been provided."}
 
 
-TUTOR MODE
+MODE
 
 {tutor_mode}
 
 
-MODE INSTRUCTIONS
+MODE INSTRUCTION
 
 {mode_instructions[tutor_mode]}
 """
 
-    return call_ai(
+    return call_text_ai(
         system_message=system_message,
         user_message=user_message,
-        model_name=model_name,
+        model_name=text_model,
         temperature=0.3,
         max_tokens=3_000,
     )
 
 
+# =========================================================
+# PLANNER
+# =========================================================
+
 def create_schedule_analysis(
-    tasks: list[dict],
+    tasks: list[dict[str, Any]],
     available_hours: float,
     energy_level: int,
     planning_notes: str,
-    model_name: str,
+    text_model: str,
 ) -> str:
-    """Recommend a realistic daily study plan."""
+    """Generate a realistic daily study plan."""
 
-    task_lines = []
+    task_sections: list[str] = []
 
     for index, task in enumerate(tasks, start=1):
-        task_lines.append(
+        task_sections.append(
             f"""
 Task {index}
 Name: {task["name"]}
@@ -444,21 +695,17 @@ Importance: {task["importance"]}/5
 """
         )
 
-    task_text = "\n".join(task_lines)
-
     system_message = """
 You are a workload analyst for an engineering student.
 
-Build realistic plans rather than motivational or overly optimistic
-schedules.
+Create realistic schedules rather than overly optimistic schedules.
 
-Prioritize deadlines, importance, difficulty, and cognitive energy.
+Use deadlines, importance, difficulty, available time, and cognitive
+energy.
 
 Include breaks and transition time.
 
-Do not schedule more work than can fit into the student's available time.
-
-When the work cannot all fit, state what should be postponed or reduced.
+Never schedule more work than fits.
 """
 
     user_message = f"""
@@ -467,39 +714,43 @@ AVAILABLE STUDY HOURS
 {available_hours}
 
 
-CURRENT ENERGY LEVEL
+ENERGY LEVEL
 
 {energy_level}/10
 
 
 TASKS
 
-{task_text}
+{"".join(task_sections)}
 
 
-ADDITIONAL CONTEXT
+OTHER CONTEXT
 
-{planning_notes or "No additional planning context was provided."}
+{planning_notes or "No additional context was supplied."}
 
 
 CREATE:
 
 1. Priority order
-2. Recommended time blocks
+2. Recommended study blocks
 3. Break schedule
-4. What not to do today
-5. Main risk to the plan
-6. A simpler fallback plan
+4. What should not be attempted today
+5. Main risk
+6. Simpler fallback plan
 """
 
-    return call_ai(
+    return call_text_ai(
         system_message=system_message,
         user_message=user_message,
-        model_name=model_name,
+        model_name=text_model,
         temperature=0.2,
         max_tokens=2_500,
     )
 
+
+# =========================================================
+# REFLECTION
+# =========================================================
 
 def analyze_reflection(
     planned_work: str,
@@ -509,25 +760,17 @@ def analyze_reflection(
     distraction: str,
     energy_level: int,
     tomorrow_change: str,
-    model_name: str,
+    text_model: str,
 ) -> str:
-    """Analyze a student's end-of-day reflection."""
+    """Analyze an end-of-day reflection."""
 
     system_message = """
 You are an engineering student's reflection coach.
 
-Your job is to identify useful patterns without being judgmental.
+Identify useful patterns without being judgmental.
 
-Focus on:
-
-1. Planning accuracy
-2. Time-estimation errors
-3. Energy patterns
-4. Distractions
-5. Knowledge gaps
-6. One or two realistic improvements
-
-Do not overwhelm the student with a long list of changes.
+Focus on planning accuracy, time estimation, energy, distractions,
+knowledge gaps, and one or two realistic improvements.
 """
 
     user_message = f"""
@@ -546,12 +789,12 @@ COMPLETED WORK
 {completed_work}
 
 
-WHAT TOOK LONGER OR SHORTER THAN EXPECTED
+TIME SURPRISE
 
 {time_surprise}
 
 
-CONCEPT THAT REMAINS UNCLEAR
+UNCLEAR CONCEPT
 
 {unclear_concept}
 
@@ -561,12 +804,12 @@ MAIN DISTRACTION
 {distraction}
 
 
-ENERGY LEVEL
+ENERGY
 
 {energy_level}/10
 
 
-STUDENT'S IDEA FOR TOMORROW
+PROPOSED CHANGE FOR TOMORROW
 
 {tomorrow_change}
 
@@ -580,49 +823,40 @@ PROVIDE:
 5. One active-recall question
 """
 
-    return call_ai(
+    return call_text_ai(
         system_message=system_message,
         user_message=user_message,
-        model_name=model_name,
+        model_name=text_model,
         temperature=0.25,
         max_tokens=2_000,
     )
 
+
+# =========================================================
+# INTERVIEW GYM
+# =========================================================
 
 def create_interview_feedback(
     interview_type: str,
     target_role: str,
     question: str,
     answer: str,
-    model_name: str,
+    text_model: str,
 ) -> str:
-    """Evaluate an interview answer."""
+    """Evaluate one written interview response."""
 
     system_message = """
 You are an engineering internship interview coach.
 
-Give candid, constructive feedback.
+Give candid and constructive feedback.
 
-For behavioral answers, evaluate:
+For behavioral responses, evaluate STAR structure, evidence, ownership,
+results, reflection, and conciseness.
 
-- STAR structure
-- Specific evidence
-- Ownership
-- Results
-- Reflection
-- Conciseness
+For technical responses, evaluate problem framing, assumptions,
+accuracy, safety awareness, communication, and uncertainty.
 
-For technical answers, evaluate:
-
-- Problem framing
-- Assumptions
-- Technical accuracy
-- Safety awareness
-- Communication
-- Ability to reason under uncertainty
-
-Never invent experiences for the student.
-Help improve how the student's real experience is communicated.
+Never invent an experience for the student.
 """
 
     user_message = f"""
@@ -631,7 +865,7 @@ INTERVIEW TYPE
 {interview_type}
 
 
-TARGET ROLE OR COMPANY
+TARGET ROLE
 
 {target_role or "General engineering internship"}
 
@@ -648,30 +882,30 @@ STUDENT ANSWER
 
 PROVIDE:
 
-1. Overall score from 1 to 10
+1. Score from 1 to 10
 2. What was strong
-3. What was unclear or weak
-4. Missing evidence or technical reasoning
-5. A stronger answer structure
-6. A revised example using only facts already supplied
-7. One follow-up question an interviewer may ask
+3. What was unclear
+4. Missing evidence or reasoning
+5. Stronger answer structure
+6. Revised example using only supplied facts
+7. One likely follow-up question
 """
 
-    return call_ai(
+    return call_text_ai(
         system_message=system_message,
         user_message=user_message,
-        model_name=model_name,
+        model_name=text_model,
         temperature=0.25,
         max_tokens=2_500,
     )
 
 
 # =========================================================
-# ERROR DISPLAY
+# ERROR HANDLING
 # =========================================================
 
 def display_ai_error(error: Exception) -> None:
-    """Show a readable error without displaying a long traceback."""
+    """Display a readable error without exposing a full traceback."""
 
     error_text = str(error)
     lower_error = error_text.lower()
@@ -680,35 +914,33 @@ def display_ai_error(error: Exception) -> None:
 
     if "api key" in lower_error or "authentication" in lower_error:
         st.warning(
-            "Check that your Groq API key was copied correctly into "
-            "Streamlit Secrets."
-        )
-
-    elif "rate limit" in lower_error or "429" in lower_error:
-        st.warning(
-            "The free API limit may have been reached. Wait briefly "
-            "and try again with a smaller PDF."
+            "Check the GROQ_API_KEY entry in Streamlit Secrets."
         )
 
     elif "model" in lower_error and (
         "not found" in lower_error
         or "does not exist" in lower_error
+        or "decommissioned" in lower_error
     ):
         st.warning(
-            "The selected model may no longer be available. "
-            "Check Groq's supported-model list."
+            "That model may not be enabled or may have changed. "
+            "Try another model name in the sidebar."
+        )
+
+    elif "rate limit" in lower_error or "429" in lower_error:
+        st.warning(
+            "You may have reached a free usage limit. Wait briefly "
+            "and try fewer pages."
         )
 
     elif "too large" in lower_error or "context" in lower_error:
         st.warning(
-            "The request may be too large. Try a shorter PDF or "
-            "reduce the amount of extracted text."
+            "The request may be too large. Try one to three pages."
         )
 
     else:
         st.warning(
-            "Open Manage app → Logs if you need the detailed "
-            "technical error."
+            "Open Manage app → Logs for more technical information."
         )
 
     with st.expander("Technical error details"):
@@ -728,12 +960,16 @@ with st.sidebar:
 
     st.markdown("---")
 
-    model_name = st.text_input(
-        "AI model",
-        value=DEFAULT_MODEL,
-        help=(
-            "This must be a currently supported Groq model ID."
-        ),
+    text_model = st.text_input(
+        "Text model",
+        value=TEXT_MODEL,
+        help="Used for study guides, planning, tutoring, and feedback.",
+    )
+
+    vision_model = st.text_input(
+        "Vision model",
+        value=VISION_MODEL,
+        help="Used to read scanned and handwritten pages.",
     )
 
     if GROQ_API_KEY:
@@ -747,18 +983,15 @@ with st.sidebar:
 
     st.write(
         """
-Use AI to strengthen your thinking—not to replace it.
+Use AI to strengthen your thinking—not replace it.
 
-Attempt difficult problems before requesting complete solutions.
-Verify important technical equations and calculations.
+Review every visual transcription because handwriting, equations,
+and diagrams can be misread.
 """
     )
 
     st.markdown("---")
-
-    st.caption(
-        "Version 2.0 · Personal prototype"
-    )
+    st.caption("EngineerOS v3 · Vision Notes")
 
 
 # =========================================================
@@ -777,7 +1010,7 @@ planning, reflection, and interview preparation.
 if not GROQ_API_KEY:
     st.warning(
         """
-Before using the AI features, add your Groq key under:
+Add your Groq API key under:
 
 **Manage app → Settings → Secrets**
 """
@@ -785,12 +1018,12 @@ Before using the AI features, add your Groq key under:
 
 
 # =========================================================
-# MAIN NAVIGATION
+# MAIN TABS
 # =========================================================
 
 notes_tab, tutor_tab, planner_tab, reflection_tab, interview_tab = st.tabs(
     [
-        "📚 Notes Lab",
+        "📚 Vision Notes Lab",
         "🧠 Intuition Tutor",
         "📅 Daily Planner",
         "📝 Reflection",
@@ -800,104 +1033,353 @@ notes_tab, tutor_tab, planner_tab, reflection_tab, interview_tab = st.tabs(
 
 
 # =========================================================
-# NOTES LAB
+# VISION NOTES LAB
 # =========================================================
 
 with notes_tab:
-    st.header("📚 Notes Lab")
+    st.header("📚 Vision Notes Lab")
 
     st.write(
         """
-Upload typed notes or digital lecture slides and transform them
-into an active learning resource.
+Upload a typed PDF, scanned PDF, handwritten PDF, image,
+or camera photograph.
 """
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload one PDF",
-        type=["pdf"],
-        key="notes_pdf",
+    input_method = st.radio(
+        "Choose an input method",
+        [
+            "Upload PDF",
+            "Upload image",
+            "Use camera",
+        ],
+        horizontal=True,
     )
 
     selected_action = st.selectbox(
-        "Choose an action",
+        "Study action",
         STUDY_ACTIONS,
     )
 
     student_context = st.text_area(
         "Optional context",
         placeholder=(
-            "Example: These are Thermodynamics notes about the "
-            "first law. I understand the equation but struggle "
-            "with sign conventions and physical intuition."
+            "Example: These are Physics II notes. Please pay close "
+            "attention to vectors, signs, and handwritten equations."
         ),
-        height=110,
+        height=100,
     )
 
-    if uploaded_file is not None:
-        try:
-            extracted_text = extract_pdf_text(
-                uploaded_file.getvalue()
+    source_text = ""
+    vision_images: list[tuple[str, bytes]] = []
+    ready_for_vision = False
+
+    if input_method == "Upload PDF":
+        uploaded_pdf = st.file_uploader(
+            "Upload one PDF",
+            type=["pdf"],
+            key="vision_pdf_uploader",
+        )
+
+        if uploaded_pdf is not None:
+            pdf_bytes = uploaded_pdf.getvalue()
+
+            try:
+                page_count = get_pdf_page_count(pdf_bytes)
+                source_text = extract_pdf_text(pdf_bytes)
+
+                st.info(
+                    f"PDF contains {page_count} page(s)."
+                )
+
+                if source_text:
+                    st.success(
+                        f"Embedded text was found: "
+                        f"{len(source_text):,} characters."
+                    )
+
+                    with st.expander("Preview embedded text"):
+                        st.text_area(
+                            "Extracted PDF text",
+                            value=source_text[:15_000],
+                            height=300,
+                            disabled=True,
+                        )
+
+                    processing_choice = st.radio(
+                        "How should this PDF be processed?",
+                        [
+                            "Use embedded text",
+                            "Use vision on selected pages",
+                        ],
+                        help=(
+                            "Choose vision when the PDF contains "
+                            "handwriting, diagrams, or badly extracted text."
+                        ),
+                    )
+
+                else:
+                    st.warning(
+                        "No embedded text was found. Vision mode is required."
+                    )
+
+                    processing_choice = "Use vision on selected pages"
+
+                if processing_choice == "Use vision on selected pages":
+                    page_col1, page_col2 = st.columns(2)
+
+                    with page_col1:
+                        start_page = st.number_input(
+                            "Starting page",
+                            min_value=1,
+                            max_value=page_count,
+                            value=1,
+                            step=1,
+                        )
+
+                    maximum_end_page = min(
+                        page_count,
+                        int(start_page) + MAX_VISION_PAGES - 1,
+                    )
+
+                    with page_col2:
+                        end_page = st.number_input(
+                            "Ending page",
+                            min_value=int(start_page),
+                            max_value=maximum_end_page,
+                            value=maximum_end_page,
+                            step=1,
+                        )
+
+                    selected_count = int(end_page - start_page + 1)
+
+                    st.caption(
+                        f"{selected_count} page(s) selected. "
+                        f"Maximum per request: {MAX_VISION_PAGES}."
+                    )
+
+                    if st.button(
+                        "Read selected pages with vision",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        with st.spinner(
+                            "Rendering and reading the selected pages..."
+                        ):
+                            try:
+                                rendered_pages = render_pdf_pages(
+                                    pdf_bytes=pdf_bytes,
+                                    start_page=int(start_page),
+                                    end_page=int(end_page),
+                                )
+
+                                vision_images = [
+                                    (
+                                        f"PDF page {page_number}",
+                                        image_bytes,
+                                    )
+                                    for page_number, image_bytes
+                                    in rendered_pages
+                                ]
+
+                                st.session_state[
+                                    "vision_transcription"
+                                ] = analyze_page_images(
+                                    page_images=vision_images,
+                                    vision_model=vision_model,
+                                    extra_context=student_context,
+                                )
+
+                            except Exception as error:
+                                display_ai_error(error)
+
+                    if st.session_state["vision_transcription"]:
+                        st.subheader("Vision transcription")
+
+                        st.markdown(
+                            st.session_state[
+                                "vision_transcription"
+                            ]
+                        )
+
+                        verified = st.checkbox(
+                            "I reviewed the transcription against the original pages."
+                        )
+
+                        if verified:
+                            source_text = st.session_state[
+                                "vision_transcription"
+                            ]
+                            ready_for_vision = True
+
+                else:
+                    ready_for_vision = bool(source_text)
+
+            except Exception as error:
+                st.error("The PDF could not be processed.")
+
+                with st.expander("Technical details"):
+                    st.code(str(error))
+
+    elif input_method == "Upload image":
+        uploaded_images = st.file_uploader(
+            "Upload JPG, JPEG, or PNG notes",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            key="vision_image_uploader",
+        )
+
+        if uploaded_images:
+            limited_images = uploaded_images[:MAX_VISION_PAGES]
+
+            if len(uploaded_images) > MAX_VISION_PAGES:
+                st.warning(
+                    f"Only the first {MAX_VISION_PAGES} images "
+                    f"will be analyzed."
+                )
+
+            preview_columns = st.columns(
+                min(len(limited_images), 3)
             )
 
-            if not extracted_text:
-                st.error(
-                    "No readable text was found. The PDF may be "
-                    "scanned, handwritten, or image-based."
-                )
-
-            else:
-                character_count = len(extracted_text)
-
-                st.success(
-                    f"PDF processed: approximately "
-                    f"{character_count:,} characters extracted."
-                )
-
-                with st.expander("Preview extracted text"):
-                    st.text_area(
-                        "PDF text preview",
-                        value=extracted_text[:15_000],
-                        height=320,
-                        disabled=True,
+            for index, uploaded_image in enumerate(limited_images):
+                with preview_columns[index % len(preview_columns)]:
+                    st.image(
+                        uploaded_image,
+                        caption=uploaded_image.name,
                     )
 
-                if character_count > MAX_NOTE_CHARACTERS:
-                    st.info(
-                        f"This beginner version will analyze the first "
-                        f"{MAX_NOTE_CHARACTERS:,} characters."
-                    )
-
-                notes_for_ai = extracted_text[
-                    :MAX_NOTE_CHARACTERS
-                ]
-
-                if st.button(
-                    "Analyze my notes",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    with st.spinner(
-                        "Building your study resource..."
-                    ):
-                        try:
-                            st.session_state["notes_result"] = (
-                                analyze_notes(
-                                    notes_text=notes_for_ai,
-                                    selected_action=selected_action,
-                                    student_context=student_context,
-                                    model_name=model_name,
-                                )
+            if st.button(
+                "Read uploaded images with vision",
+                type="primary",
+                use_container_width=True,
+            ):
+                with st.spinner("Reading the uploaded notes..."):
+                    try:
+                        image_items = [
+                            (
+                                uploaded_image.name,
+                                uploaded_image.getvalue(),
                             )
+                            for uploaded_image in limited_images
+                        ]
 
-                        except Exception as error:
-                            display_ai_error(error)
+                        st.session_state[
+                            "vision_transcription"
+                        ] = analyze_page_images(
+                            page_images=image_items,
+                            vision_model=vision_model,
+                            extra_context=student_context,
+                        )
 
-        except Exception as error:
-            st.error("The PDF could not be processed.")
+                    except Exception as error:
+                        display_ai_error(error)
 
-            with st.expander("Technical error details"):
-                st.code(str(error))
+            if st.session_state["vision_transcription"]:
+                st.subheader("Vision transcription")
+
+                st.markdown(
+                    st.session_state[
+                        "vision_transcription"
+                    ]
+                )
+
+                verified = st.checkbox(
+                    "I reviewed the transcription against my images."
+                )
+
+                if verified:
+                    source_text = st.session_state[
+                        "vision_transcription"
+                    ]
+                    ready_for_vision = True
+
+    else:
+        camera_image = st.camera_input(
+            "Take a clear photograph of one page"
+        )
+
+        if camera_image is not None:
+            st.image(
+                camera_image,
+                caption="Camera image",
+            )
+
+            if st.button(
+                "Read camera image with vision",
+                type="primary",
+                use_container_width=True,
+            ):
+                with st.spinner("Reading the photographed notes..."):
+                    try:
+                        st.session_state[
+                            "vision_transcription"
+                        ] = analyze_page_images(
+                            page_images=[
+                                (
+                                    "Camera photograph",
+                                    camera_image.getvalue(),
+                                )
+                            ],
+                            vision_model=vision_model,
+                            extra_context=student_context,
+                        )
+
+                    except Exception as error:
+                        display_ai_error(error)
+
+            if st.session_state["vision_transcription"]:
+                st.subheader("Vision transcription")
+
+                st.markdown(
+                    st.session_state[
+                        "vision_transcription"
+                    ]
+                )
+
+                verified = st.checkbox(
+                    "I reviewed the transcription against the photograph."
+                )
+
+                if verified:
+                    source_text = st.session_state[
+                        "vision_transcription"
+                    ]
+                    ready_for_vision = True
+
+    if source_text and (
+        ready_for_vision
+        or input_method == "Upload PDF"
+    ):
+        st.markdown("---")
+        st.subheader("Create study resource")
+
+        if len(source_text) > MAX_TEXT_CHARACTERS:
+            st.info(
+                f"The study resource will use the first "
+                f"{MAX_TEXT_CHARACTERS:,} characters."
+            )
+
+        notes_for_ai = source_text[:MAX_TEXT_CHARACTERS]
+
+        if st.button(
+            f"Create: {selected_action}",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner("Creating your study resource..."):
+                try:
+                    st.session_state[
+                        "notes_result"
+                    ] = create_study_resource(
+                        notes_text=notes_for_ai,
+                        selected_action=selected_action,
+                        student_context=student_context,
+                        text_model=text_model,
+                    )
+
+                except Exception as error:
+                    display_ai_error(error)
 
     if st.session_state["notes_result"]:
         st.markdown("---")
@@ -917,18 +1399,11 @@ into an active learning resource.
 
 
 # =========================================================
-# INTUITION TUTOR
+# INTUITION TUTOR TAB
 # =========================================================
 
 with tutor_tab:
     st.header("🧠 Intuition Tutor")
-
-    st.write(
-        """
-Use this tutor to strengthen reasoning rather than immediately
-receiving a final answer.
-"""
-    )
 
     tutor_col1, tutor_col2 = st.columns(2)
 
@@ -963,19 +1438,11 @@ receiving a final answer.
 
     tutor_topic = st.text_area(
         "Concept, equation, or problem",
-        placeholder=(
-            "Example: Why does increasing temperature increase "
-            "pressure in a rigid ideal-gas container?"
-        ),
         height=140,
     )
 
     student_attempt = st.text_area(
         "Your attempt or current understanding",
-        placeholder=(
-            "Explain what you think is happening before asking "
-            "the tutor for help."
-        ),
         height=140,
     )
 
@@ -992,14 +1459,14 @@ receiving a final answer.
         else:
             with st.spinner("Thinking through your problem..."):
                 try:
-                    st.session_state["tutor_result"] = (
-                        generate_tutor_response(
-                            subject=subject,
-                            topic=tutor_topic,
-                            student_attempt=student_attempt,
-                            tutor_mode=tutor_mode,
-                            model_name=model_name,
-                        )
+                    st.session_state[
+                        "tutor_result"
+                    ] = generate_tutor_response(
+                        subject=subject,
+                        topic=tutor_topic,
+                        student_attempt=student_attempt,
+                        tutor_mode=tutor_mode,
+                        text_model=text_model,
                     )
 
                 except Exception as error:
@@ -1007,24 +1474,22 @@ receiving a final answer.
 
     if st.session_state["tutor_result"]:
         st.markdown("---")
-        st.subheader("Tutor Response")
-
         st.markdown(
             st.session_state["tutor_result"]
         )
 
 
 # =========================================================
-# DAILY PLANNER
+# DAILY PLANNER TAB
 # =========================================================
 
 with planner_tab:
     st.header("📅 Daily Planner")
 
-    st.write(
+    st.info(
         """
-Add your tasks, then generate a realistic study plan based on
-available time, difficulty, importance, and energy.
+Google Calendar connection will be added after Vision Notes
+is confirmed working. This version uses tasks entered manually.
 """
     )
 
@@ -1032,7 +1497,7 @@ available time, difficulty, importance, and energy.
 
     with planner_col1:
         available_hours = st.number_input(
-            "Available study hours today",
+            "Available study hours",
             min_value=0.5,
             max_value=16.0,
             value=4.0,
@@ -1041,25 +1506,21 @@ available time, difficulty, importance, and energy.
 
     with planner_col2:
         planning_energy = st.slider(
-            "Current energy level",
-            min_value=1,
-            max_value=10,
-            value=7,
+            "Energy level",
+            1,
+            10,
+            7,
         )
-
-    st.subheader("Add a task")
 
     task_col1, task_col2 = st.columns(2)
 
     with task_col1:
         task_name = st.text_input(
-            "Task name",
-            placeholder="Complete Physics problem set",
+            "Task name"
         )
 
         task_subject = st.text_input(
-            "Subject",
-            placeholder="Physics",
+            "Subject"
         )
 
         task_deadline = st.date_input(
@@ -1078,16 +1539,16 @@ available time, difficulty, importance, and energy.
 
         task_difficulty = st.slider(
             "Difficulty",
-            min_value=1,
-            max_value=5,
-            value=3,
+            1,
+            5,
+            3,
         )
 
         task_importance = st.slider(
             "Importance",
-            min_value=1,
-            max_value=5,
-            value=4,
+            1,
+            5,
+            4,
         )
 
     if st.button("Add task"):
@@ -1098,10 +1559,7 @@ available time, difficulty, importance, and energy.
             st.session_state["task_list"].append(
                 {
                     "name": task_name.strip(),
-                    "subject": (
-                        task_subject.strip()
-                        or "Unspecified"
-                    ),
+                    "subject": task_subject.strip() or "Unspecified",
                     "deadline": task_deadline.isoformat(),
                     "minutes": int(task_minutes),
                     "difficulty": int(task_difficulty),
@@ -1112,156 +1570,101 @@ available time, difficulty, importance, and energy.
             st.success("Task added.")
 
     if st.session_state["task_list"]:
-        st.subheader("Today's task list")
+        st.subheader("Task list")
 
         for task_index, task in enumerate(
             st.session_state["task_list"]
         ):
-            task_text = (
-                f"**{task['name']}** — "
-                f"{task['subject']} · "
-                f"{task['minutes']} min · "
-                f"Difficulty {task['difficulty']}/5 · "
-                f"Importance {task['importance']}/5 · "
-                f"Due {task['deadline']}"
-            )
+            display_col, delete_col = st.columns([9, 1])
 
-            task_display_col, delete_col = st.columns(
-                [9, 1]
-            )
-
-            with task_display_col:
-                st.write(task_text)
+            with display_col:
+                st.write(
+                    f"**{task['name']}** — {task['subject']} · "
+                    f"{task['minutes']} min · "
+                    f"Difficulty {task['difficulty']}/5 · "
+                    f"Importance {task['importance']}/5 · "
+                    f"Due {task['deadline']}"
+                )
 
             with delete_col:
                 if st.button(
                     "✕",
                     key=f"delete_task_{task_index}",
                 ):
-                    st.session_state["task_list"].pop(
-                        task_index
-                    )
+                    st.session_state["task_list"].pop(task_index)
                     st.rerun()
 
         planning_notes = st.text_area(
-            "Additional planning context",
-            placeholder=(
-                "Example: I have class until 2 PM and need a "
-                "30-minute dinner break."
-            ),
+            "Additional planning context"
         )
 
-        planner_button_col, clear_button_col = st.columns(2)
+        if st.button(
+            "Create my study plan",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner("Analyzing your workload..."):
+                try:
+                    st.session_state[
+                        "planner_result"
+                    ] = create_schedule_analysis(
+                        tasks=st.session_state["task_list"],
+                        available_hours=available_hours,
+                        energy_level=planning_energy,
+                        planning_notes=planning_notes,
+                        text_model=text_model,
+                    )
 
-        with planner_button_col:
-            if st.button(
-                "Create my study plan",
-                type="primary",
-                use_container_width=True,
-            ):
-                with st.spinner(
-                    "Analyzing your workload..."
-                ):
-                    try:
-                        st.session_state["planner_result"] = (
-                            create_schedule_analysis(
-                                tasks=st.session_state[
-                                    "task_list"
-                                ],
-                                available_hours=available_hours,
-                                energy_level=planning_energy,
-                                planning_notes=planning_notes,
-                                model_name=model_name,
-                            )
-                        )
-
-                    except Exception as error:
-                        display_ai_error(error)
-
-        with clear_button_col:
-            if st.button(
-                "Clear all tasks",
-                use_container_width=True,
-            ):
-                st.session_state["task_list"] = []
-                st.session_state["planner_result"] = ""
-                st.rerun()
-
-    else:
-        st.info(
-            "Add at least one task to create a study plan."
-        )
+                except Exception as error:
+                    display_ai_error(error)
 
     if st.session_state["planner_result"]:
         st.markdown("---")
-        st.subheader("Recommended Plan")
-
         st.markdown(
             st.session_state["planner_result"]
         )
 
-        st.download_button(
-            "Download today's plan",
-            data=st.session_state["planner_result"],
-            file_name=f"study_plan_{date.today()}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
 
 # =========================================================
-# REFLECTION
+# REFLECTION TAB
 # =========================================================
 
 with reflection_tab:
     st.header("📝 Daily Reflection")
 
-    st.write(
-        """
-Compare what you planned with what actually happened.
-Over time, this can help improve estimation and study decisions.
-"""
-    )
-
     planned_work = st.text_area(
-        "What did you plan to complete?",
-        height=100,
+        "What did you plan to complete?"
     )
 
     completed_work = st.text_area(
-        "What did you actually complete?",
-        height=100,
+        "What did you actually complete?"
     )
 
     time_surprise = st.text_area(
-        "What took longer or shorter than expected?",
-        height=90,
+        "What took longer or shorter than expected?"
     )
 
     unclear_concept = st.text_area(
-        "What concept is still unclear?",
-        height=90,
+        "What concept remains unclear?"
     )
 
     reflection_col1, reflection_col2 = st.columns(2)
 
     with reflection_col1:
         distraction = st.text_input(
-            "Main distraction",
-            placeholder="Phone, fatigue, unclear instructions...",
+            "Main distraction"
         )
 
     with reflection_col2:
         reflection_energy = st.slider(
-            "Energy level today",
-            min_value=1,
-            max_value=10,
-            value=6,
+            "Energy today",
+            1,
+            10,
+            6,
         )
 
     tomorrow_change = st.text_area(
-        "What would you change tomorrow?",
-        height=90,
+        "What would you change tomorrow?"
     )
 
     if st.button(
@@ -1275,11 +1678,11 @@ Over time, this can help improve estimation and study decisions.
             )
 
         else:
-            with st.spinner(
-                "Finding useful patterns..."
-            ):
+            with st.spinner("Finding useful patterns..."):
                 try:
-                    result = analyze_reflection(
+                    st.session_state[
+                        "reflection_result"
+                    ] = analyze_reflection(
                         planned_work=planned_work,
                         completed_work=completed_work,
                         time_surprise=time_surprise,
@@ -1287,20 +1690,7 @@ Over time, this can help improve estimation and study decisions.
                         distraction=distraction,
                         energy_level=reflection_energy,
                         tomorrow_change=tomorrow_change,
-                        model_name=model_name,
-                    )
-
-                    st.session_state["reflection_result"] = result
-
-                    st.session_state[
-                        "reflection_history"
-                    ].append(
-                        {
-                            "timestamp": datetime.now().isoformat(
-                                timespec="minutes"
-                            ),
-                            "reflection": result,
-                        }
+                        text_model=text_model,
                     )
 
                 except Exception as error:
@@ -1308,50 +1698,23 @@ Over time, this can help improve estimation and study decisions.
 
     if st.session_state["reflection_result"]:
         st.markdown("---")
-        st.subheader("Reflection Analysis")
-
         st.markdown(
             st.session_state["reflection_result"]
         )
 
-        reflection_download = f"""
-# Daily Reflection
-
-Date: {date.today().isoformat()}
-
-## Planned Work
-
-{planned_work}
-
-## Completed Work
-
-{completed_work}
-
-## Coach Analysis
-
-{st.session_state["reflection_result"]}
-"""
-
-        st.download_button(
-            "Download reflection",
-            data=reflection_download,
-            file_name=f"reflection_{date.today()}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
 
 # =========================================================
-# INTERVIEW GYM
+# INTERVIEW TAB
 # =========================================================
 
 with interview_tab:
     st.header("💼 Interview Gym")
 
-    st.write(
+    st.info(
         """
-Practice behavioral or technical engineering questions and
-receive structured feedback.
+The microphone and complete multi-question interview will be
+added after Vision Notes is confirmed working. This version
+keeps the written practice feature.
 """
     )
 
@@ -1371,16 +1734,12 @@ receive structured feedback.
 
     with interview_col2:
         target_role = st.text_input(
-            "Target role or company",
-            placeholder=(
-                "Process Engineering Intern at Dow"
-            ),
+            "Target role or company"
         )
 
     default_questions = {
         "Behavioral": (
-            "Tell me about a time you faced a difficult "
-            "team challenge."
+            "Tell me about a time you faced a difficult team challenge."
         ),
         "Technical": (
             "How would you approach sizing a heat exchanger?"
@@ -1389,27 +1748,21 @@ receive structured feedback.
             "Tell me about a technical project you completed."
         ),
         "Safety scenario": (
-            "What would you do if you observed an unsafe "
-            "condition in a chemical plant?"
+            "What would you do if you observed an unsafe condition?"
         ),
         "Troubleshooting scenario": (
-            "A process flow rate suddenly decreases. "
-            "How would you investigate the problem?"
+            "A process flow rate suddenly decreases. How would "
+            "you investigate the problem?"
         ),
     }
 
     interview_question = st.text_area(
         "Interview question",
         value=default_questions[interview_type],
-        height=100,
     )
 
     interview_answer = st.text_area(
         "Your answer",
-        placeholder=(
-            "Write your answer as if you were speaking "
-            "to the interviewer."
-        ),
         height=220,
     )
 
@@ -1419,36 +1772,19 @@ receive structured feedback.
         use_container_width=True,
     ):
         if not interview_answer.strip():
-            st.warning(
-                "Write your interview answer first."
-            )
+            st.warning("Write your answer first.")
 
         else:
-            with st.spinner(
-                "Evaluating your response..."
-            ):
+            with st.spinner("Evaluating your response..."):
                 try:
-                    result = create_interview_feedback(
+                    st.session_state[
+                        "interview_result"
+                    ] = create_interview_feedback(
                         interview_type=interview_type,
                         target_role=target_role,
                         question=interview_question,
                         answer=interview_answer,
-                        model_name=model_name,
-                    )
-
-                    st.session_state["interview_result"] = result
-
-                    st.session_state[
-                        "interview_history"
-                    ].append(
-                        {
-                            "timestamp": datetime.now().isoformat(
-                                timespec="minutes"
-                            ),
-                            "type": interview_type,
-                            "question": interview_question,
-                            "feedback": result,
-                        }
+                        text_model=text_model,
                     )
 
                 except Exception as error:
@@ -1456,42 +1792,8 @@ receive structured feedback.
 
     if st.session_state["interview_result"]:
         st.markdown("---")
-        st.subheader("Interview Feedback")
-
         st.markdown(
             st.session_state["interview_result"]
-        )
-
-        interview_download = f"""
-# Interview Practice
-
-## Type
-
-{interview_type}
-
-## Target Role
-
-{target_role or "General engineering internship"}
-
-## Question
-
-{interview_question}
-
-## My Answer
-
-{interview_answer}
-
-## Feedback
-
-{st.session_state["interview_result"]}
-"""
-
-        st.download_button(
-            "Download interview feedback",
-            data=interview_download,
-            file_name="interview_feedback.md",
-            mime="text/markdown",
-            use_container_width=True,
         )
 
 
@@ -1504,7 +1806,7 @@ st.markdown("---")
 st.caption(
     """
 EngineerOS is a learning assistant, not an authoritative engineering
-reference. Verify technical equations, calculations, safety decisions,
-and course requirements using trusted sources.
+reference. Verify equations, calculations, handwriting transcriptions,
+safety decisions, and course requirements.
 """
 )
